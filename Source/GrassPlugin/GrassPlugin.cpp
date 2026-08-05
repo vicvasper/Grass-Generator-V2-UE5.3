@@ -1,6 +1,9 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright (c) Victor Rivas Perez. All Rights Reserved.
 
 #include "GrassPlugin.h"
+
 #include "Modules/ModuleManager.h"
 
-IMPLEMENT_PRIMARY_GAME_MODULE( FDefaultGameModuleImpl, GrassPlugin, "GrassPlugin" );
+DEFINE_LOG_CATEGORY(LogGrassPlugin);
+
+IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, GrassPlugin, "GrassPlugin");

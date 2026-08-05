@@ -1,711 +1,662 @@
+// Copyright (c) Victor Rivas Perez. All Rights Reserved.
+
 #include "GrassGenerator.h"
-#include <Editor/LandscapeEditor/Public/LandscapeEditorUtils.h>
-#include <Editor/LandscapeEditor/Public/LandscapeEditorObject.h>
-#include "Engine/Texture2D.h"
-#include "EngineUtils.h" // Para TActorIterator
-#include "ScopedTransaction.h"
 
-// Constructor
-AGrassGenerator::AGrassGenerator()
-{
-    PrimaryActorTick.bCanEverTick = false; // No necesitamos Tick
-    bAutoGenerateGrass = true; // Por defecto, no auto-generar césped
-
-    // Asignar rutas de activos a los miembros de clase existentes
-    LandscapeMaterialPath = TEXT("/Game/StylizedGrass/Materials/MI_Landscape.MI_Landscape");
-    GrassPhysicalMaterialPath = TEXT("/Game/StylizedGrass/Materials/PM_Grass.PM_Grass");
-    OtherPhysicalMaterialPath = TEXT("/Game/StylizedGrass/Materials/PM_Other.PM_Other");
-    LandscapeVirtualTexturePath = TEXT("/Game/StylizedGrass/Materials/RVT_Landscape.RVT_Landscape");
-
-    LandscapeMaterial = LoadObject<UMaterialInterface>(nullptr, *this->LandscapeMaterialPath);
-    GrassPhysicalMaterial = LoadObject<UPhysicalMaterial>(nullptr, *this->GrassPhysicalMaterialPath);
-    OtherPhysicalMaterial = LoadObject<UPhysicalMaterial>(nullptr, *this->OtherPhysicalMaterialPath);
-    LandscapeVirtualTexture = LoadObject<URuntimeVirtualTexture>(nullptr, *this->LandscapeVirtualTexturePath);
-}
-
-
-// Called when the actor is constructed (en el editor o durante el juego)
-void AGrassGenerator::OnConstruction(const FTransform& Transform)
-{
-    Super::OnConstruction(Transform);
+#include "Engine/World.h"
+#include "EngineUtils.h"
+#include "GrassPlugin.h"
+#include "Materials/MaterialInterface.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
+#include "TimerManager.h"
 
 #if WITH_EDITOR
-    if (bAutoGenerateGrass)
-    {
-        GenerateGrass();
-    }
+#include "Components/RuntimeVirtualTextureComponent.h"
+#include "Engine/Texture2D.h"
+#include "Landscape.h"
+#include "LandscapeComponent.h"
+#include "LandscapeInfo.h"
+#include "LandscapeLayerInfoObject.h"
+#include "LandscapeProxy.h"
+#include "Misc/PackageName.h"
+#include "ScopedTransaction.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+#include "VT/RuntimeVirtualTexture.h"
+#include "VT/RuntimeVirtualTextureVolume.h"
 #endif
+
+namespace
+{
+	/**
+	 * Default asset paths, matching the sample content the plugin ships with.
+	 *
+	 * Seeds for the corresponding properties rather than baked-in constants: the previous
+	 * version hardcoded them in the implementation, which meant the actor silently did nothing
+	 * in any project that did not reproduce this exact folder layout.
+	 */
+	const TCHAR* const DefaultLandscapeMaterialPath = TEXT("/Game/StylizedGrass/Materials/MI_Landscape.MI_Landscape");
+	const TCHAR* const DefaultGrassPhysicalMaterialPath = TEXT("/Game/StylizedGrass/Materials/PM_Grass.PM_Grass");
+	const TCHAR* const DefaultOtherPhysicalMaterialPath = TEXT("/Game/StylizedGrass/Materials/PM_Other.PM_Other");
+	const TCHAR* const DefaultLandscapeVirtualTexturePath = TEXT("/Game/StylizedGrass/Materials/RVT_Landscape.RVT_Landscape");
+	const TCHAR* const DefaultLayerInfoPackageRoot = TEXT("/Game/StylizedGrass/LayerInfos");
+
+	const FName DefaultGrassLayerName(TEXT("Grass"));
+	const FName DefaultOtherLayerName(TEXT("Other"));
+
+	/**
+	 * Delay before the deferred passes run.
+	 *
+	 * The original scheduled these with a rate of 1.0s and a first delay of 0.1s, but a
+	 * non-looping timer fires at its first delay and never uses the rate - so the effective
+	 * wait has always been 0.1s. Kept at the value that was actually in effect.
+	 */
+	constexpr float DefaultLandscapeSettleDelay = 0.1f;
+
+	/** Full weight for a landscape layer, in weightmap units. */
+	constexpr uint8 FullLayerWeight = 255;
+
+	/** Half a texel, the offset used to centre the virtual texture snap on the landscape grid. */
+	constexpr float HalfTexel = 0.5f;
+
+#if WITH_EDITOR
+	/**
+	 * Maps a weightmap channel index onto the FColor component holding it.
+	 *
+	 * Returned as a pointer-to-member so the branch is resolved once per texture rather than
+	 * once per pixel, and so the mapping does not depend on FColor's in-memory byte order.
+	 */
+	uint8 FColor::* GetWeightmapChannelMember(uint8 ChannelIndex)
+	{
+		switch (ChannelIndex)
+		{
+		case 0:  return &FColor::R;
+		case 1:  return &FColor::G;
+		case 2:  return &FColor::B;
+		case 3:  return &FColor::A;
+		default: return nullptr;
+		}
+	}
+#endif
+}
+
+AGrassGenerator::AGrassGenerator()
+	: LandscapeMaterial(FSoftObjectPath(DefaultLandscapeMaterialPath))
+	, GrassPhysicalMaterial(FSoftObjectPath(DefaultGrassPhysicalMaterialPath))
+	, OtherPhysicalMaterial(FSoftObjectPath(DefaultOtherPhysicalMaterialPath))
+	, LandscapeVirtualTexture(FSoftObjectPath(DefaultLandscapeVirtualTexturePath))
+	, GrassLayerName(DefaultGrassLayerName)
+	, OtherLayerName(DefaultOtherLayerName)
+	, LayerInfoPackageRoot(DefaultLayerInfoPackageRoot)
+	, bAutoGenerateOnConstruction(false)
+	, LandscapeSettleDelay(DefaultLandscapeSettleDelay)
+{
+	PrimaryActorTick.bCanEverTick = false;
+
+	// Assets are resolved in GenerateGrass, not here. LoadObject from a constructor runs during
+	// CDO creation - before the asset registry is ready, and again during cook - which is why
+	// UE offers ConstructorHelpers for the cases that genuinely need it. Nothing here does:
+	// generation is an explicit, user-triggered action.
+}
+
+void AGrassGenerator::OnConstruction(const FTransform& Transform)
+{
+	Super::OnConstruction(Transform);
+
+#if WITH_EDITOR
+	if (bAutoGenerateOnConstruction)
+	{
+		GenerateGrass();
+	}
+#endif
+}
+
+void AGrassGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	CancelPendingWork();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AGrassGenerator::Destroyed()
+{
+	CancelPendingWork();
+	Super::Destroyed();
+}
+
+void AGrassGenerator::CancelPendingWork()
+{
+	if (UWorld* World = GetWorld())
+	{
+		FTimerManager& TimerManager = World->GetTimerManager();
+		TimerManager.ClearTimer(VirtualTextureVolumeTimer);
+		TimerManager.ClearTimer(LayerInfoTimer);
+		TimerManager.ClearTimer(FillGrassTimer);
+	}
+}
+
+#if WITH_EDITOR
+
+bool AGrassGenerator::ResolveAssets()
+{
+	ResolvedLandscapeMaterial = LandscapeMaterial.LoadSynchronous();
+	ResolvedGrassPhysicalMaterial = GrassPhysicalMaterial.LoadSynchronous();
+	ResolvedOtherPhysicalMaterial = OtherPhysicalMaterial.LoadSynchronous();
+	ResolvedLandscapeVirtualTexture = LandscapeVirtualTexture.LoadSynchronous();
+
+	// Reported individually: "one of four assets failed" is not actionable.
+	bool bAllResolved = true;
+	const auto Require = [&bAllResolved](const UObject* Asset, const TCHAR* PropertyName, const FString& Path)
+	{
+		if (!Asset)
+		{
+			UE_LOG(LogGrassPlugin, Error, TEXT("%s could not be loaded from '%s'."), PropertyName, *Path);
+			bAllResolved = false;
+		}
+	};
+
+	Require(ResolvedLandscapeMaterial, TEXT("LandscapeMaterial"), LandscapeMaterial.ToString());
+	Require(ResolvedGrassPhysicalMaterial, TEXT("GrassPhysicalMaterial"), GrassPhysicalMaterial.ToString());
+	Require(ResolvedOtherPhysicalMaterial, TEXT("OtherPhysicalMaterial"), OtherPhysicalMaterial.ToString());
+	Require(ResolvedLandscapeVirtualTexture, TEXT("LandscapeVirtualTexture"), LandscapeVirtualTexture.ToString());
+
+	return bAllResolved;
 }
 
 void AGrassGenerator::GenerateGrass()
 {
-#if WITH_EDITOR
-    UE_LOG(LogTemp, Log, TEXT("Inicio de GenerateGrass."));
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
 
+	if (!ResolveAssets())
+	{
+		UE_LOG(LogGrassPlugin, Error, TEXT("Grass generation aborted: required assets are missing."));
+		return;
+	}
 
+	ApplyLandscapeMaterials();
 
-    if (!LandscapeMaterial || !GrassPhysicalMaterial || !OtherPhysicalMaterial || !LandscapeVirtualTexture)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("No se pudieron cargar todos los activos necesarios."));
-        return;
-    }
-    UE_LOG(LogTemp, Log, TEXT("Todos los activos necesarios cargados correctamente."));
+	// Scheduled once, not once per landscape. Both passes iterate every landscape themselves,
+	// so scheduling them inside the landscape loop ran the whole job N times over for N
+	// landscapes - and left N-1 uncancellable timers behind.
+	TWeakObjectPtr<AGrassGenerator> WeakThis(this);
+	FTimerManager& TimerManager = World->GetTimerManager();
 
-    UE_LOG(LogTemp, Log, TEXT("Transacción iniciada para generación de césped."));
+	TimerManager.SetTimer(VirtualTextureVolumeTimer, [WeakThis]()
+	{
+		if (AGrassGenerator* Self = WeakThis.Get())
+		{
+			Self->SetupVirtualTextureVolume();
+		}
+	}, LandscapeSettleDelay, false);
 
-    TArray<AActor*> FoundActors;
-    UGameplayStatics::GetAllActorsOfClass(GetWorld(), ALandscape::StaticClass(), FoundActors);
-    UE_LOG(LogTemp, Log, TEXT("Se encontraron %d actores de tipo Landscape."), FoundActors.Num());
+	TimerManager.SetTimer(LayerInfoTimer, [WeakThis]()
+	{
+		if (AGrassGenerator* Self = WeakThis.Get())
+		{
+			Self->SetupLayerInfos();
+		}
+	}, LandscapeSettleDelay, false);
+}
 
-    for (AActor* Actor : FoundActors)
-    {
-        ALandscape* Landscape = Cast<ALandscape>(Actor);
-        if (Landscape)
-        {
-            UE_LOG(LogTemp, Log, TEXT("Procesando Landscape: %s"), *Landscape->GetName());
+void AGrassGenerator::ApplyLandscapeMaterials()
+{
+	int32 LandscapeCount = 0;
 
-            Landscape->Modify();
+	for (TActorIterator<ALandscape> It(GetWorld()); It; ++It)
+	{
+		ALandscape* Landscape = *It;
+		++LandscapeCount;
 
-            if (Landscape->GetLandscapeMaterial() != LandscapeMaterial)
-            {
-                Landscape->LandscapeMaterial = LandscapeMaterial;
+		if (Landscape->GetLandscapeMaterial() == ResolvedLandscapeMaterial)
+		{
+			continue;
+		}
 
-                FPropertyChangedEvent MaterialChangedEvent(FindFieldChecked<FProperty>(ALandscapeProxy::StaticClass(), GET_MEMBER_NAME_CHECKED(ALandscapeProxy, LandscapeMaterial)));
-                Landscape->PostEditChangeProperty(MaterialChangedEvent);
-                Landscape->MarkPackageDirty();
-                UE_LOG(LogTemp, Log, TEXT("Material del Landscape actualizado."));
-            }
+		Landscape->Modify();
+		Landscape->LandscapeMaterial = ResolvedLandscapeMaterial;
 
-            FTimerHandle VolumeTimerHandle;
-            GetWorld()->GetTimerManager().SetTimer(VolumeTimerHandle, this, &AGrassGenerator::SetupVirtualTextureVolume, 1.0f, false, 0.1f);
+		FPropertyChangedEvent MaterialChangedEvent(FindFieldChecked<FProperty>(
+			ALandscapeProxy::StaticClass(),
+			GET_MEMBER_NAME_CHECKED(ALandscapeProxy, LandscapeMaterial)));
 
-            FTimerHandle LayerTimerHandle;
-            GetWorld()->GetTimerManager().SetTimer(LayerTimerHandle, this, &AGrassGenerator::SetupLayerInfos, 1.0f, false, 0.1f);
-   
+		Landscape->PostEditChangeProperty(MaterialChangedEvent);
+		Landscape->MarkPackageDirty();
 
+		UE_LOG(LogGrassPlugin, Log, TEXT("Assigned landscape material to '%s'."), *Landscape->GetName());
+	}
 
-        }
-    }
-
-    UE_LOG(LogTemp, Log, TEXT("Finalización inicial de GenerateGrass."));
-#endif
+	if (LandscapeCount == 0)
+	{
+		UE_LOG(LogGrassPlugin, Warning, TEXT("No landscape actors found in this level."));
+	}
 }
 
 void AGrassGenerator::SetupLayerInfos()
 {
-#if WITH_EDITOR
-    UE_LOG(LogTemp, Log, TEXT("Iniciando configuración de LayerInfos."));
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
 
-    TArray<AActor*> FoundActors;
-    UGameplayStatics::GetAllActorsOfClass(GetWorld(), ALandscape::StaticClass(), FoundActors);
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		ALandscape* Landscape = *It;
 
-    for (AActor* Actor : FoundActors)
-    {
-        ALandscape* Landscape = Cast<ALandscape>(Actor);
-        if (Landscape)
-        {
-            UE_LOG(LogTemp, Log, TEXT("Procesando Landscape: %s"), *Landscape->GetName());
+		ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
+		if (!LandscapeInfo)
+		{
+			UE_LOG(LogGrassPlugin, Warning, TEXT("'%s' has no landscape info yet; skipping."), *Landscape->GetName());
+			continue;
+		}
 
-            ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-            if (!LandscapeInfo)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("No se pudo obtener LandscapeInfo para el Landscape."));
-                continue;
-            }
+		ULandscapeLayerInfoObject* GrassLayerInfo = nullptr;
 
-            ULandscapeLayerInfoObject* GrassLayerInfo = nullptr;
+		for (FLandscapeInfoLayerSettings& LayerSettings : LandscapeInfo->Layers)
+		{
+			const bool bIsGrassLayer = (LayerSettings.LayerName == GrassLayerName);
 
-            // Iterar sobre los LayerSettings
-            for (FLandscapeInfoLayerSettings& LayerSettings : LandscapeInfo->Layers)
-            {
-                if (LayerSettings.LayerInfoObj == nullptr)
-                {
-                    UPhysicalMaterial* PhysMaterial = nullptr;
+			if (LayerSettings.LayerInfoObj)
+			{
+				if (bIsGrassLayer)
+				{
+					GrassLayerInfo = LayerSettings.LayerInfoObj;
+				}
+				continue;
+			}
 
-                    if (LayerSettings.LayerName == FName(TEXT("Grass")))
-                    {
-                        UE_LOG(LogTemp, Log, TEXT("Asignando LayerInfo para la capa 'Grass'."));
-                        PhysMaterial = GrassPhysicalMaterial;
-                    }
-                    else if (LayerSettings.LayerName == FName(TEXT("Other")))
-                    {
-                        UE_LOG(LogTemp, Log, TEXT("Asignando LayerInfo para la capa 'Other'."));
-                        PhysMaterial = OtherPhysicalMaterial;
-                    }
-                    else
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("Capa desconocida: %s"), *LayerSettings.LayerName.ToString());
-                        continue;
-                    }
+			UPhysicalMaterial* PhysMaterial = nullptr;
+			if (bIsGrassLayer)
+			{
+				PhysMaterial = ResolvedGrassPhysicalMaterial;
+			}
+			else if (LayerSettings.LayerName == OtherLayerName)
+			{
+				PhysMaterial = ResolvedOtherPhysicalMaterial;
+			}
+			else
+			{
+				UE_LOG(LogGrassPlugin, Warning,
+					TEXT("Layer '%s' matches neither GrassLayerName nor OtherLayerName; leaving it alone."),
+					*LayerSettings.LayerName.ToString());
+				continue;
+			}
 
-                    // Crear o cargar LayerInfo
-                    ULandscapeLayerInfoObject* LayerInfo = GetOrCreateLayerInfo(LayerSettings.LayerName, PhysMaterial);
-                    if (LayerInfo)
-                    {
-                        LayerSettings.LayerInfoObj = LayerInfo;
+			ULandscapeLayerInfoObject* LayerInfo = GetOrCreateLayerInfo(LayerSettings.LayerName, PhysMaterial);
+			if (!LayerInfo)
+			{
+				UE_LOG(LogGrassPlugin, Warning, TEXT("Could not create a layer info for '%s'."),
+					*LayerSettings.LayerName.ToString());
+				continue;
+			}
 
-                        // Asignar LayerInfo al Landscape
-                        AddLayerInfoToLandscape(Landscape, LayerInfo);
-                        UE_LOG(LogTemp, Log, TEXT("LayerInfo '%s' asignada correctamente a la capa '%s'"), *LayerInfo->GetName(), *LayerSettings.LayerName.ToString());
+			LayerSettings.LayerInfoObj = LayerInfo;
+			AddLayerInfoToLandscape(Landscape, LayerInfo);
 
-                        // Si la capa es "Grass", guardar la referencia al LayerInfo
-                        if (LayerSettings.LayerName == FName(TEXT("Grass")))
-                        {
-                            GrassLayerInfo = LayerInfo;
-                        }
-                    }
-                    else
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("No se pudo crear o cargar completamente LayerInfo para la capa '%s'."), *LayerSettings.LayerName.ToString());
-                    }
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Log, TEXT("La capa '%s' ya tiene asignada una LayerInfo."), *LayerSettings.LayerName.ToString());
+			if (bIsGrassLayer)
+			{
+				GrassLayerInfo = LayerInfo;
+			}
+		}
 
-                    // Si la capa es "Grass", guardar la referencia al LayerInfo
-                    if (LayerSettings.LayerName == FName(TEXT("Grass")))
-                    {
-                        GrassLayerInfo = LayerSettings.LayerInfoObj;
-                    }
-                }
-            }
+		if (!GrassLayerInfo)
+		{
+			UE_LOG(LogGrassPlugin, Warning, TEXT("No '%s' layer on landscape '%s'; nothing to fill."),
+				*GrassLayerName.ToString(), *Landscape->GetName());
+			continue;
+		}
 
-            // Verificar si se obtuvo GrassLayerInfo antes de proceder
-            if (!GrassLayerInfo)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("No se encontró LayerInfo para la capa 'Grass' en el Landscape '%s'."), *Landscape->GetName());
-                continue;
-            }
+		// Make sure every component carries an allocation for the grass layer.
+		for (ULandscapeComponent* Component : Landscape->LandscapeComponents)
+		{
+			if (!Component)
+			{
+				continue;
+			}
 
-            // Combinar ambos bucles en uno solo para procesar los componentes del Landscape
-            for (ULandscapeComponent* Component : Landscape->LandscapeComponents)
-            {
-                if (!Component || !GrassLayerInfo)
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("Componente o GrassLayerInfo inválido en el Landscape '%s'."), *Landscape->GetName());
-                    continue;
-                }
+			const TArray<FWeightmapLayerAllocationInfo>& Allocations = Component->GetWeightmapLayerAllocations();
+			const bool bAlreadyAllocated = Allocations.ContainsByPredicate(
+				[GrassLayerInfo](const FWeightmapLayerAllocationInfo& Allocation)
+				{
+					return Allocation.LayerInfo == GrassLayerInfo;
+				});
 
-                // Modificar el componente antes de hacer cualquier cambio
-                Component->Modify();
+			if (bAlreadyAllocated)
+			{
+				continue;
+			}
 
-                // Verificar si la capa 'Grass' ya está asignada al componente
-                bool bLayerFound = false;
-                for (const FWeightmapLayerAllocationInfo& Allocation : Component->GetWeightmapLayerAllocations())
-                {
-                    if (Allocation.LayerInfo == GrassLayerInfo)
-                    {
-                        bLayerFound = true;
-                        break;
-                    }
-                }
+			Component->Modify();
 
-                if (!bLayerFound)
-                {
-                    // Agregar la capa 'Grass' a las asignaciones del componente
-                    FWeightmapLayerAllocationInfo NewAllocation;
-                    NewAllocation.LayerInfo = GrassLayerInfo;
-                    NewAllocation.WeightmapTextureIndex = INDEX_NONE; // Inicializar como INDEX_NONE para que Unreal lo reasigne automáticamente
-                    Component->GetWeightmapLayerAllocations().Add(NewAllocation);
-                    UE_LOG(LogTemp, Log, TEXT("Capa 'Grass' agregada al componente '%s'."), *Component->GetName());
+			// INDEX_NONE asks the landscape system to pick the texture and channel during the
+			// reallocation below.
+			FWeightmapLayerAllocationInfo NewAllocation;
+			NewAllocation.LayerInfo = GrassLayerInfo;
+			NewAllocation.WeightmapTextureIndex = INDEX_NONE;
+			Component->GetWeightmapLayerAllocations().Add(NewAllocation);
 
-                    // Llamar a PostEditChange para asegurarse de que la asignación se procese completamente
-                    Component->PostEditChange();
+			Component->PostEditChange();
+			Component->ReallocateWeightmaps(nullptr, true, true);
+			Component->MarkRenderStateDirty();
 
-                    // Forzar la reasignación de weightmaps
-                    Component->ReallocateWeightmaps(nullptr, true, true);
-                    Component->MarkRenderStateDirty();
-                    UE_LOG(LogTemp, Log, TEXT("Reasignando weightmaps para el componente: %s"), *Component->GetName());
+			UE_LOG(LogGrassPlugin, Verbose, TEXT("Allocated the '%s' layer on component '%s'."),
+				*GrassLayerName.ToString(), *Component->GetName());
+		}
 
-                    // Verificar y asegurar que hay suficiente espacio en ComponentWeightmapTextures
-                    int32 NumWeightmapTextures = Component->GetWeightmapTextures().Num();
-                    if (NumWeightmapTextures <= NewAllocation.WeightmapTextureIndex)
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("Aumentando espacio en WeightmapTextures para el componente '%s'."), *Component->GetName());
-                        // Agregar una nueva textura al arreglo si es necesario
-                        UTexture2D* NewWeightmapTexture = CreateNewWeightmapTexture();
-                        Component->GetWeightmapTextures().Add(NewWeightmapTexture);
-                    }
+		TWeakObjectPtr<AGrassGenerator> WeakThis(this);
+		TWeakObjectPtr<ALandscape> WeakLandscape(Landscape);
+		TWeakObjectPtr<ULandscapeLayerInfoObject> WeakGrassLayerInfo(GrassLayerInfo);
 
-                    // Verificar que se ha reasignado correctamente
-                    bool bValidIndex = true;
-                    for (const FWeightmapLayerAllocationInfo& Allocation : Component->GetWeightmapLayerAllocations())
-                    {
-                        if (!Component->GetWeightmapTextures().IsValidIndex(Allocation.WeightmapTextureIndex))
-                        {
-                            bValidIndex = false;
-                            UE_LOG(LogTemp, Warning, TEXT("Índice inválido encontrado en WeightmapTextureIndex después de realloc para el componente: %s"), *Component->GetName());
-                            break;
-                        }
-                    }
+		World->GetTimerManager().SetTimer(FillGrassTimer, [WeakThis, WeakLandscape, WeakGrassLayerInfo]()
+		{
+			AGrassGenerator* Self = WeakThis.Get();
+			ALandscape* TargetLandscape = WeakLandscape.Get();
+			ULandscapeLayerInfoObject* TargetLayerInfo = WeakGrassLayerInfo.Get();
 
-                    if (!bValidIndex)
-                    {
-                        // Si el índice no es válido, intentar reasignar nuevamente
-                        Component->ReallocateWeightmaps(nullptr, true, true);
-                        Component->MarkRenderStateDirty();
-                        UE_LOG(LogTemp, Warning, TEXT("Intentando reasignar weightmaps nuevamente para el componente: %s"), *Component->GetName());
-                    }
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Log, TEXT("La capa 'Grass' ya está asignada al componente '%s'."), *Component->GetName());
-                }
-            }
+			// Weak throughout: the original captured the actor, the landscape and the layer
+			// info by raw pointer, any of which could be gone a second later.
+			if (Self && TargetLandscape && TargetLayerInfo)
+			{
+				Self->FillGrassLayer(TargetLandscape, TargetLayerInfo);
+			}
+		}, LandscapeSettleDelay, false);
 
-            // Llamar a FillGrassLayer después de configurar todas las capas y asignaciones
-            FTimerHandle FillGrassTimerHandle;
-            GetWorld()->GetTimerManager().SetTimer(FillGrassTimerHandle, [this, Landscape, GrassLayerInfo]()
-                {
-                    FillGrassLayer(Landscape, GrassLayerInfo);
-                    UE_LOG(LogTemp, Log, TEXT("FillGrassLayer ejecutado para la capa 'Grass' en el Landscape '%s'."), *Landscape->GetName());
-                }, 1.0f, false, 0.1);
-            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer programado para el Landscape '%s'."), *Landscape->GetName());
-
-            // Forzar actualización del Landscape después de configurar las capas y llamar a FillGrassLayer
-            Landscape->MarkPackageDirty();
-            Landscape->PostEditChange();
-            FPropertyChangedEvent MaterialChangedEvent(FindFieldChecked<FProperty>(ALandscapeProxy::StaticClass(), GET_MEMBER_NAME_CHECKED(ALandscapeProxy, LandscapeMaterial)));
-            Landscape->PostEditChangeProperty(MaterialChangedEvent);
-            LandscapeInfo->UpdateAllComponentMaterialInstances();
-            UE_LOG(LogTemp, Log, TEXT("Capa del Landscape '%s' actualizada correctamente."), *Landscape->GetName());
-        }
-    }
-#endif
+		Landscape->MarkPackageDirty();
+		Landscape->PostEditChange();
+		LandscapeInfo->UpdateAllComponentMaterialInstances();
+	}
 }
-
-
-UTexture2D* AGrassGenerator::CreateNewWeightmapTexture()
-{
-    // Implementar la lógica para crear una nueva textura para Weightmap
-    // Esto puede incluir crear una textura con un tamaño específico y configuraciones apropiadas.
-    return NewObject<UTexture2D>();
-}
-
 
 void AGrassGenerator::FillGrassLayer(ALandscape* Landscape, ULandscapeLayerInfoObject* GrassLayerInfo)
 {
-#if WITH_EDITOR
-    // Iniciar una transacción para soporte de Undo/Redo
-    const FScopedTransaction Transaction(FText::FromString("Fill Grass Layer"));
-    UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Transacción iniciada para llenar la capa 'Grass'."));
+	const FScopedTransaction Transaction(NSLOCTEXT("GrassPlugin", "FillGrassLayer", "Fill Grass Layer"));
 
-    // Obtener LandscapeInfo
-    ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-    if (!LandscapeInfo)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: LandscapeInfo no válido."));
-        return;
-    }
+	ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
+	if (!LandscapeInfo)
+	{
+		UE_LOG(LogGrassPlugin, Warning, TEXT("FillGrassLayer: '%s' has no landscape info."), *Landscape->GetName());
+		return;
+	}
 
-    // Actualizar los materiales de los componentes y generar datos para asegurarse de que todo esté listo
-    Landscape->InvalidateGeneratedComponentData();
-    LandscapeInfo->UpdateAllComponentMaterialInstances();
-    UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Todos los componentes han sido actualizados."));
+	Landscape->InvalidateGeneratedComponentData();
+	LandscapeInfo->UpdateAllComponentMaterialInstances();
 
-    // Obtener todos los componentes del Landscape
-    TArray<ULandscapeComponent*> LandscapeComponents;
-    Landscape->GetComponents(LandscapeComponents);
-    UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Se encontraron %d componentes de Landscape."), LandscapeComponents.Num());
+	TArray<ULandscapeComponent*> LandscapeComponents;
+	Landscape->GetComponents(LandscapeComponents);
 
+	int32 FilledComponents = 0;
 
-        // Iterar sobre todos los componentes del Landscape
-        for (ULandscapeComponent* Component : LandscapeComponents)
-        {
-            if (!Component)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: Componente de Landscape no válido."));
-                continue;
-            }
-            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Procesando componente de Landscape: %s"), *Component->GetName());
+	for (ULandscapeComponent* Component : LandscapeComponents)
+	{
+		if (!Component)
+		{
+			continue;
+		}
 
-            // Obtener las asignaciones de capa de peso (WeightmapLayerAllocations)
-            TArray<FWeightmapLayerAllocationInfo>& LayerAllocations = Component->GetWeightmapLayerAllocations(true);
-            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Se encontraron %d asignaciones de capas en el componente: %s"), LayerAllocations.Num(), *Component->GetName());
+		for (const FWeightmapLayerAllocationInfo& Allocation : Component->GetWeightmapLayerAllocations(true))
+		{
+			if (Allocation.LayerInfo != GrassLayerInfo)
+			{
+				continue;
+			}
 
-            if (LayerAllocations.Num() == 0)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: No se encontraron asignaciones de capas en el componente: %s"), *Component->GetName());
-                continue;
-            }
+			const TArray<UTexture2D*>& WeightmapTextures = Component->GetWeightmapTextures();
+			if (!WeightmapTextures.IsValidIndex(Allocation.WeightmapTextureIndex))
+			{
+				UE_LOG(LogGrassPlugin, Warning,
+					TEXT("FillGrassLayer: weightmap index %d is out of range on '%s'."),
+					Allocation.WeightmapTextureIndex, *Component->GetName());
+				continue;
+			}
 
-            // Iterar sobre todas las asignaciones de capas de peso
-            for (FWeightmapLayerAllocationInfo& LayerInfo : LayerAllocations)
-            {
-                UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Iterando sobre una LayerInfo en el componente '%s'."), *Component->GetName());
+			// Checked before the name is read from it; the previous version logged the texture
+			// name first and only then tested for null.
+			UTexture2D* WeightmapTexture = WeightmapTextures[Allocation.WeightmapTextureIndex];
+			if (!WeightmapTexture || !WeightmapTexture->GetPlatformData())
+			{
+				UE_LOG(LogGrassPlugin, Warning,
+					TEXT("FillGrassLayer: no platform data for the weightmap on '%s'."), *Component->GetName());
+				continue;
+			}
 
-                if (LayerInfo.LayerInfo)
-                {
-                    // Obtener el nombre de la capa y convertirlo a texto
-                    FString LayerName = LayerInfo.LayerInfo->LayerName.ToString();
-                    UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Nombre de la capa en el componente '%s': %s"), *Component->GetName(), *LayerName);
+			// The layer's channel comes from the allocation. Writing all four components - as
+			// the previous version did, despite a comment stating grass was on red - set every
+			// layer sharing this texture to full weight, not just grass.
+			uint8 FColor::* const ChannelMember = GetWeightmapChannelMember(Allocation.WeightmapTextureChannel);
+			if (!ChannelMember)
+			{
+				UE_LOG(LogGrassPlugin, Warning, TEXT("FillGrassLayer: unexpected weightmap channel %d on '%s'."),
+					Allocation.WeightmapTextureChannel, *Component->GetName());
+				continue;
+			}
 
-                    // Comparar el nombre de la capa con "Grass"
-                    if (LayerName == "Grass")
-                    {
-                        UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Capa 'Grass' encontrada en el componente: %s"), *Component->GetName());
+			FTexture2DMipMap& Mip = WeightmapTexture->GetPlatformData()->Mips[0];
+			FColor* Pixels = static_cast<FColor*>(Mip.BulkData.Lock(LOCK_READ_WRITE));
+			if (!Pixels)
+			{
+				Mip.BulkData.Unlock();
+				UE_LOG(LogGrassPlugin, Warning, TEXT("FillGrassLayer: could not lock the weightmap on '%s'."),
+					*Component->GetName());
+				continue;
+			}
 
-                        // Obtener el índice de la capa en el array de WeightmapTextures
-                        int32 WeightmapIndex = LayerInfo.WeightmapTextureIndex;
-                        UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Índice de Weightmap para la capa 'Grass': %d"), WeightmapIndex);
+			const int32 PixelCount = WeightmapTexture->GetSizeX() * WeightmapTexture->GetSizeY();
+			for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+			{
+				Pixels[PixelIndex].*ChannelMember = FullLayerWeight;
+			}
 
-                        // Verificar si el índice es válido
-                        if (Component->GetWeightmapTextures().IsValidIndex(WeightmapIndex))
-                        {
-                            // Obtener la textura de Weightmap correspondiente
-                            UTexture2D* WeightmapTexture = Component->GetWeightmapTextures()[WeightmapIndex];
-                            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: WeightmapTexture obtenida para el componente: %s"), *WeightmapTexture->GetName());
+			Mip.BulkData.Unlock();
+			WeightmapTexture->UpdateResource();
+			++FilledComponents;
+		}
+	}
 
-                            // Verificar si la textura y sus datos de plataforma son válidos
-                            if (!WeightmapTexture || !WeightmapTexture->GetPlatformData())
-                            {
-                                UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: WeightmapTexture no válida para la capa 'Grass' en el componente: %s"), *Component->GetName());
-                                continue;
-                            }
+	Landscape->InvalidateGeneratedComponentData();
+	LandscapeInfo->UpdateAllComponentMaterialInstances();
 
-                            // Bloquear el acceso a los datos de la textura
-                            FTexture2DMipMap& Mip = WeightmapTexture->GetPlatformData()->Mips[0];
-                            void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
-                            FColor* FormData = static_cast<FColor*>(Data);
-
-                            if (!FormData)
-                            {
-                                UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: No se pudo acceder a los datos de la textura para 'Grass' en el componente: %s"), *Component->GetName());
-                                Mip.BulkData.Unlock();
-                                continue;
-                            }
-
-                            // Obtener las dimensiones de la textura
-                            int32 TextureSizeX = WeightmapTexture->GetSizeX();
-                            int32 TextureSizeY = WeightmapTexture->GetSizeY();
-                            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Dimensiones de la textura: (%d, %d)"), TextureSizeX, TextureSizeY);
-
-                            // Iterar sobre todos los píxeles y establecer el valor de la capa "Grass" al máximo
-                            for (int32 Y = 0; Y < TextureSizeY; ++Y)
-                            {
-                                for (int32 X = 0; X < TextureSizeX; ++X)
-                                {
-                                    int32 Index = Y * TextureSizeX + X;
-                                    FColor& Pixel = FormData[Index];
-
-                                    // Asumiendo que "Grass" está asignado al canal Rojo (R)
-                                    Pixel.R = 255;
-                                    Pixel.G = 255;
-                                    Pixel.B = 255;
-                                    Pixel.A = 255;
-                                }
-                            }
-
-                            // Desbloquear y actualizar la textura
-                            Mip.BulkData.Unlock();
-                            WeightmapTexture->UpdateResource();
-
-                            UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: Capa 'Grass' completamente pintada en el componente: %s"), *Component->GetName());
-                        }
-                        else
-                        {
-                            UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: Índice de WeightmapTexture no válido para el componente: %s"), *Component->GetName());
-                        }
-                    }
-                    else
-                    {
-                        UE_LOG(LogTemp, Log, TEXT("FillGrassLayer: La capa actual no es 'Grass' (es '%s'). Continuando con la siguiente."), *LayerName);
-                    }
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("FillGrassLayer: LayerInfo.LayerInfo es nullptr en el componente '%s'."), *Component->GetName());
-                }
-            }
-        }
-
-        // Asegurarse de que los datos estén actualizados después de la primera iteración
-        Landscape->InvalidateGeneratedComponentData();
-        LandscapeInfo->UpdateAllComponentMaterialInstances();
-    
-
-#endif
+	UE_LOG(LogGrassPlugin, Log, TEXT("Filled the '%s' layer on %d of %d components of '%s'."),
+		*GrassLayerInfo->LayerName.ToString(), FilledComponents, LandscapeComponents.Num(), *Landscape->GetName());
 }
-
-
-
-
-
-
-
-
-
-
 
 void AGrassGenerator::SetupVirtualTextureVolume()
 {
-#if WITH_EDITOR
-    UE_LOG(LogTemp, Log, TEXT("Iniciando configuración de Virtual Texture Volume."));
+	UWorld* World = GetWorld();
+	if (!World || !ResolvedLandscapeVirtualTexture)
+	{
+		return;
+	}
 
-    // Iniciar una transacción para soportar Undo/Redo
-    const FScopedTransaction Transaction(FText::FromString("Crear Runtime Virtual Texture Volume"));
+	const FScopedTransaction Transaction(
+		NSLOCTEXT("GrassPlugin", "CreateRVTVolume", "Create Runtime Virtual Texture Volume"));
 
-    // Comprobar si ya existe un RVT_Volume en la escena
-    for (TActorIterator<ARuntimeVirtualTextureVolume> It(GetWorld()); It; ++It)
-    {
-        ARuntimeVirtualTextureVolume* ExistingVolume = *It;
-        if (ExistingVolume)
-        {
-            UE_LOG(LogTemp, Log, TEXT("Ya existe un Runtime Virtual Texture Volume en la escena, no se creará otro."));
-            return; // Salir si ya existe un RVT_Volume
-        }
-    }
+	for (TActorIterator<ARuntimeVirtualTextureVolume> It(World); It; ++It)
+	{
+		UE_LOG(LogGrassPlugin, Log, TEXT("A runtime virtual texture volume already exists; leaving it in place."));
+		return;
+	}
 
-    // Obtener todos los actores de tipo Landscape en el mundo nuevamente
-    TArray<AActor*> FoundActors;
-    UGameplayStatics::GetAllActorsOfClass(GetWorld(), ALandscape::StaticClass(), FoundActors);
+	for (TActorIterator<ALandscape> It(World); It; ++It)
+	{
+		ALandscape* Landscape = *It;
+		Landscape->Modify();
 
-    for (AActor* Actor : FoundActors)
-    {
-        ALandscape* Landscape = Cast<ALandscape>(Actor);
-        if (Landscape)
-        {
-            // Marcar el Landscape como modificado para registrar los cambios en la transacción
-            Landscape->Modify();
+		ARuntimeVirtualTextureVolume* Volume = World->SpawnActor<ARuntimeVirtualTextureVolume>();
+		if (!Volume || !Volume->VirtualTextureComponent)
+		{
+			UE_LOG(LogGrassPlugin, Warning, TEXT("Could not spawn a runtime virtual texture volume."));
+			continue;
+		}
 
-            ARuntimeVirtualTextureVolume* RVT_Volume = GetWorld()->SpawnActor<ARuntimeVirtualTextureVolume>(ARuntimeVirtualTextureVolume::StaticClass());
-            if (RVT_Volume)
-            {
-                // Marcar el RVT_Volume como modificado para soportar Undo/Redo
-                RVT_Volume->Modify();
+		Volume->Modify();
+		Volume->VirtualTextureComponent->SetVirtualTexture(ResolvedLandscapeVirtualTexture);
+		Landscape->RuntimeVirtualTextures.Add(ResolvedLandscapeVirtualTexture);
 
-                // *** Asignar la LandscapeVirtualTexture ***
-                if (LandscapeVirtualTexture) // Verificamos que esté cargada correctamente
-                {
-                    RVT_Volume->VirtualTextureComponent->SetVirtualTexture(LandscapeVirtualTexture);
-                    Landscape->RuntimeVirtualTextures.Add(LandscapeVirtualTexture);
-                    UE_LOG(LogTemp, Log, TEXT("LandscapeVirtualTexture asignada correctamente al Runtime Virtual Texture Volume."));
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("No se pudo asignar LandscapeVirtualTexture porque no está cargada."));
-                }
+		const FQuat TargetRotation = Landscape->GetActorRotation().Quaternion();
+		const FTransform LocalTransform(TargetRotation, Landscape->GetActorLocation(), FVector::OneVector);
+		const FTransform WorldToLocal = LocalTransform.Inverse();
 
-                // Cálculo de los límites del Landscape
-                FVector Origin;
-                FVector BoxExtent;
-                Landscape->GetActorBounds(false, Origin, BoxExtent);
+		// Grow the volume to cover every primitive writing into this virtual texture.
+		FBox Bounds(ForceInit);
+		for (TObjectIterator<UPrimitiveComponent> ComponentIt; ComponentIt; ++ComponentIt)
+		{
+			const TArray<URuntimeVirtualTexture*>& VirtualTextures = ComponentIt->GetRuntimeVirtualTextures();
+			if (!VirtualTextures.Contains(ResolvedLandscapeVirtualTexture))
+			{
+				continue;
+			}
 
-                // Alinear el componente Virtual Texture con el landscape
-                FQuat TargetRotation = Landscape->GetActorRotation().Quaternion();
-                FVector TargetPosition = Landscape->GetActorLocation();
+			const FBoxSphereBounds LocalSpaceBounds =
+				ComponentIt->CalcBounds(ComponentIt->GetComponentTransform() * WorldToLocal);
 
-                FTransform LocalTransform(TargetRotation, TargetPosition, FVector::OneVector);
-                FTransform WorldToLocal = LocalTransform.Inverse();
+			if (LocalSpaceBounds.GetBox().GetVolume() > 0.0f)
+			{
+				Bounds += LocalSpaceBounds.GetBox();
+			}
+		}
 
-                // Expandir los límites para el actor alineado a los bounds y todas las primitivas que escriben en esta textura virtual
-                FBox Bounds(ForceInit);
-                for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
-                {
-                    bool bUseBounds = false;
-                    const TArray<URuntimeVirtualTexture*>& VirtualTextures = It->GetRuntimeVirtualTextures();
-                    for (int32 Index = 0; Index < VirtualTextures.Num(); ++Index)
-                    {
-                        if (VirtualTextures[Index] == RVT_Volume->VirtualTextureComponent->GetVirtualTexture())
-                        {
-                            bUseBounds = true;
-                            break;
-                        }
-                    }
+		FTransform VolumeTransform(
+			TargetRotation, LocalTransform.TransformPosition(Bounds.Min), Bounds.GetSize());
 
-                    if (bUseBounds)
-                    {
-                        FBoxSphereBounds LocalSpaceBounds = It->CalcBounds(It->GetComponentTransform() * WorldToLocal);
-                        if (LocalSpaceBounds.GetBox().GetVolume() > 0.f)
-                        {
-                            Bounds += LocalSpaceBounds.GetBox();
-                        }
-                    }
-                }
+		if (Volume->VirtualTextureComponent->GetSnapBoundsToLandscape())
+		{
+			const ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
+			if (LandscapeInfo)
+			{
+				const FVector LandscapeScale = Landscape->GetTransform().GetScale3D();
 
-                // Calcular la transformación para ajustar los bounds
-                FVector LocalPosition = Bounds.Min;
-                FVector WorldPosition = LocalTransform.TransformPosition(LocalPosition);
-                FVector WorldSize = Bounds.GetSize();
-                FTransform Transform(TargetRotation, WorldPosition, WorldSize);
+				int32 MinX, MinY, MaxX, MaxY;
+				LandscapeInfo->GetLandscapeExtent(MinX, MinY, MaxX, MaxY);
 
-                // Ajustar y snapear al landscape si es necesario
-                if (RVT_Volume->VirtualTextureComponent->GetSnapBoundsToLandscape())
-                {
-                    const ALandscape* LandscapeActor = Cast<ALandscape>(Landscape);
-                    if (LandscapeActor)
-                    {
-                        const FTransform LandscapeTransform = LandscapeActor->GetTransform();
-                        const FVector LandscapePosition = LandscapeTransform.GetTranslation();
-                        const FVector LandscapeScale = LandscapeTransform.GetScale3D();
+				const FIntPoint LandscapeSize(MaxX - MinX + 1, MaxY - MinY + 1);
+				const int32 LandscapeSizeLog2 =
+					FMath::Max(FMath::CeilLogTwo(LandscapeSize.X), FMath::CeilLogTwo(LandscapeSize.Y));
 
-                        const ULandscapeInfo* LandscapeInfo = LandscapeActor->GetLandscapeInfo();
-                        int32 MinX, MinY, MaxX, MaxY;
-                        LandscapeInfo->GetLandscapeExtent(MinX, MinY, MaxX, MaxY);
-                        const FIntPoint LandscapeSize(MaxX - MinX + 1, MaxY - MinY + 1);
-                        const int32 LandscapeSizeLog2 = FMath::Max(FMath::CeilLogTwo(LandscapeSize.X), FMath::CeilLogTwo(LandscapeSize.Y));
+				const int32 VirtualTextureSize = ResolvedLandscapeVirtualTexture->GetSize();
+				const int32 VirtualTextureSizeLog2 = FMath::FloorLog2(VirtualTextureSize);
 
-                        const int32 VirtualTextureSize = LandscapeVirtualTexture->GetSize();
-                        const int32 VirtualTextureSizeLog2 = FMath::FloorLog2(VirtualTextureSize);
+				const int32 TexelsPerVertexLog2 = FMath::Max(VirtualTextureSizeLog2 - LandscapeSizeLog2, 0);
+				const int32 TexelsPerVertex = 1 << TexelsPerVertexLog2;
+				const FVector TexelWorldSize = LandscapeScale / static_cast<float>(TexelsPerVertex);
 
-                        // Ajustar escala
-                        const int32 VirtualTexelsPerLandscapeVertexLog2 = FMath::Max(VirtualTextureSizeLog2 - LandscapeSizeLog2, 0);
-                        const int32 VirtualTexelsPerLandscapeVertex = 1 << VirtualTexelsPerLandscapeVertexLog2;
-                        const FVector VirtualTexelWorldSize = LandscapeScale / (float)VirtualTexelsPerLandscapeVertex;
-                        const FVector VirtualTextureScale = VirtualTexelWorldSize * (float)VirtualTextureSize;
+				VolumeTransform.SetScale3D(FVector(
+					(TexelWorldSize * static_cast<float>(VirtualTextureSize)).X,
+					(TexelWorldSize * static_cast<float>(VirtualTextureSize)).Y,
+					VolumeTransform.GetScale3D().Z));
 
-                        Transform.SetScale3D(FVector(VirtualTextureScale.X, VirtualTextureScale.Y, Transform.GetScale3D().Z));
+				// Snap onto the landscape's texel grid so the virtual texture is not sampled
+				// half a texel off.
+				const FVector BasePosition = VolumeTransform.GetTranslation();
+				const FVector SnapOrigin = Landscape->GetTransform().GetTranslation() - HalfTexel * TexelWorldSize;
 
-                        // Snap de posición para alinear con el landscape
-                        const FVector BaseVirtualTexturePosition = Transform.GetTranslation();
-                        const FVector LandscapeSnapPosition = LandscapePosition - 0.5f * VirtualTexelWorldSize;
-                        const float SnapOffsetX = FMath::Frac((BaseVirtualTexturePosition.X - LandscapeSnapPosition.X) / VirtualTexelWorldSize.X) * VirtualTexelWorldSize.X;
-                        const float SnapOffsetY = FMath::Frac((BaseVirtualTexturePosition.Y - LandscapeSnapPosition.Y) / VirtualTexelWorldSize.Y) * VirtualTexelWorldSize.Y;
-                        const FVector VirtualTexturePosition = BaseVirtualTexturePosition - FVector(SnapOffsetX, SnapOffsetY, 0);
-                        Transform.SetTranslation(FVector(VirtualTexturePosition.X, VirtualTexturePosition.Y, VirtualTexturePosition.Z));
-                    }
-                }
+				const float SnapOffsetX = FMath::Frac((BasePosition.X - SnapOrigin.X) / TexelWorldSize.X) * TexelWorldSize.X;
+				const float SnapOffsetY = FMath::Frac((BasePosition.Y - SnapOrigin.Y) / TexelWorldSize.Y) * TexelWorldSize.Y;
 
-                // Aplicar la transformación calculada
-                RVT_Volume->SetActorTransform(Transform);
+				VolumeTransform.SetTranslation(BasePosition - FVector(SnapOffsetX, SnapOffsetY, 0.0f));
+			}
+		}
 
-                // Marcar el estado de renderizado como sucio
-                RVT_Volume->VirtualTextureComponent->MarkRenderStateDirty();
+		Volume->SetActorTransform(VolumeTransform);
+		Volume->VirtualTextureComponent->MarkRenderStateDirty();
 
-                UE_LOG(LogTemp, Log, TEXT("Runtime Virtual Texture Volume configurado correctamente."));
-            }
-            else
-            {
-                UE_LOG(LogTemp, Warning, TEXT("Error al configurar el RVT Volume para el Landscape."));
-            }
-        }
-    }
-
-    UE_LOG(LogTemp, Log, TEXT("Finalización del proceso de configuración de Virtual Texture Volume."));
-#endif
+		UE_LOG(LogGrassPlugin, Log, TEXT("Runtime virtual texture volume aligned to '%s'."), *Landscape->GetName());
+	}
 }
 
 ULandscapeLayerInfoObject* AGrassGenerator::GetOrCreateLayerInfo(FName LayerName, UPhysicalMaterial* PhysMaterial)
 {
-#if WITH_EDITOR
-    ULandscapeLayerInfoObject* LayerInfo = nullptr;
-    // Construir el AssetPath con el sufijo _LayerInfo
-    FString AssetPath = FString::Printf(TEXT("/Game/StylizedGrass/LayerInfos/%s.%s"), *LayerName.ToString(), *LayerName.ToString());
+	const FString PackageName = FString::Printf(TEXT("%s/%s"), *LayerInfoPackageRoot, *LayerName.ToString());
+	const FString AssetPath = FString::Printf(TEXT("%s.%s"), *PackageName, *LayerName.ToString());
 
-    // Intentar cargar el asset existente
-    LayerInfo = LoadObject<ULandscapeLayerInfoObject>(nullptr, *AssetPath);
+	if (ULandscapeLayerInfoObject* Existing = LoadObject<ULandscapeLayerInfoObject>(nullptr, *AssetPath))
+	{
+		UPackage* ExistingPackage = Existing->GetOutermost();
+		if (ExistingPackage && !ExistingPackage->IsFullyLoaded())
+		{
+			ExistingPackage->FullyLoad();
+		}
+		return Existing;
+	}
 
-    if (!LayerInfo)
-    {
-        // Definir el nombre del paquete con el sufijo _LayerInfo
-        FString PackageName = FString::Printf(TEXT("/Game/StylizedGrass/LayerInfos/%s"), *LayerName.ToString());
-        UPackage* Package = CreatePackage(*PackageName);
-        FString ObjectName = FString::Printf(TEXT("%s"), *LayerName.ToString());
+	UPackage* Package = CreatePackage(*PackageName);
+	if (!Package)
+	{
+		UE_LOG(LogGrassPlugin, Warning, TEXT("Could not create package '%s'."), *PackageName);
+		return nullptr;
+	}
 
-        // Crear el objeto LayerInfo dentro del paquete creado
-        LayerInfo = NewObject<ULandscapeLayerInfoObject>(Package, FName(*ObjectName), RF_Public | RF_Standalone | RF_Transactional);
+	ULandscapeLayerInfoObject* LayerInfo = NewObject<ULandscapeLayerInfoObject>(
+		Package, LayerName, RF_Public | RF_Standalone | RF_Transactional);
 
-        if (LayerInfo)
-        {
-            // Asignar propiedades al LayerInfo
-            LayerInfo->LayerName = LayerName;
-            LayerInfo->PhysMaterial = PhysMaterial;
+	if (!LayerInfo)
+	{
+		UE_LOG(LogGrassPlugin, Warning, TEXT("Could not create a layer info for '%s'."), *LayerName.ToString());
+		return nullptr;
+	}
 
-            // Marcar el paquete como sucio para indicar que ha sido modificado
-            Package->MarkPackageDirty();
+	LayerInfo->LayerName = LayerName;
+	LayerInfo->PhysMaterial = PhysMaterial;
+	Package->MarkPackageDirty();
 
-            // Definir el nombre de archivo para guardar el paquete
-            FString PackageFileName = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
+	const FString PackageFileName =
+		FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
 
-            // Configurar los argumentos para guardar el paquete
-            FSavePackageArgs SaveArgs;
-            SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-            SaveArgs.Error = GError;
-            SaveArgs.SaveFlags = SAVE_None;
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GError;
+	SaveArgs.SaveFlags = SAVE_None;
 
-            // Guardar el paquete
-            bool bSaved = UPackage::SavePackage(Package, LayerInfo, *PackageFileName, SaveArgs);
-            if (bSaved)
-            {
-                UE_LOG(LogTemp, Log, TEXT("LayerInfo '%s' creada y guardada exitosamente."), *LayerInfo->GetName());
+	if (!UPackage::SavePackage(Package, LayerInfo, *PackageFileName, SaveArgs))
+	{
+		// The object is still usable in memory, so it is returned rather than discarded - but
+		// it will not survive a restart, which the caller cannot tell without being told.
+		UE_LOG(LogGrassPlugin, Warning,
+			TEXT("Layer info '%s' was created but could not be saved to '%s'; it will be lost on reload."),
+			*LayerName.ToString(), *PackageFileName);
+		return LayerInfo;
+	}
 
-                // Asegurarse de que el paquete esté completamente cargado
-                Package->FullyLoad();
+	Package->FullyLoad();
+	UE_LOG(LogGrassPlugin, Log, TEXT("Created and saved layer info '%s'."), *LayerName.ToString());
 
-                bool bFullyLoaded = Package->IsFullyLoaded();
-                if (bFullyLoaded)
-                {
-                    UE_LOG(LogTemp, Log, TEXT("Paquete '%s' cargado completamente después de guardar."), *PackageName);
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("No se pudo cargar completamente el paquete '%s' después de guardarlo."), *PackageName);
-                }
-            }
-            else
-            {
-                UE_LOG(LogTemp, Warning, TEXT("No se pudo guardar el LayerInfo para la capa '%s'."), *LayerName.ToString());
-            }
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("No se pudo crear el LayerInfo para la capa '%s'."), *LayerName.ToString());
-        }
-    }
-    else
-    {
-        // Asegurarse de que el paquete del asset cargado esté completamente cargado
-        UPackage* Package = LayerInfo->GetOutermost();
-        if (Package && !Package->IsFullyLoaded())
-        {
-            Package->FullyLoad(); // Llama a FullyLoad sin asignar a una variable bool
-
-            bool bLoaded = Package->IsFullyLoaded();
-            if (bLoaded)
-            {
-                UE_LOG(LogTemp, Log, TEXT("Paquete del LayerInfo '%s' cargado completamente."), *LayerInfo->GetName());
-            }
-            else
-            {
-                UE_LOG(LogTemp, Warning, TEXT("No se pudo cargar completamente el paquete del LayerInfo '%s'."), *LayerInfo->GetName());
-            }
-        }
-    }
-
-    return LayerInfo;
-#else
-    return nullptr;
-#endif
+	return LayerInfo;
 }
-
 
 void AGrassGenerator::AddLayerInfoToLandscape(ALandscape* Landscape, ULandscapeLayerInfoObject* LayerInfo)
 {
-#if WITH_EDITOR
-    if (!LayerInfo || !Landscape)
-    {
-        return;
-    }
+	if (!Landscape || !LayerInfo)
+	{
+		return;
+	}
 
-    if (!Landscape->EditorLayerSettings.ContainsByPredicate([LayerInfo](const FLandscapeEditorLayerSettings& Settings)
-        {
-            return Settings.LayerInfoObj == LayerInfo;
-        }))
-    {
-        Landscape->EditorLayerSettings.Add(FLandscapeEditorLayerSettings(LayerInfo));
-    }
+	const auto MatchesLayerInfo = [LayerInfo](const auto& Settings)
+	{
+		return Settings.LayerInfoObj == LayerInfo;
+	};
 
-    ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo();
-    if (LandscapeInfo)
-    {
-        if (!LandscapeInfo->Layers.ContainsByPredicate([LayerInfo](const FLandscapeInfoLayerSettings& Settings)
-            {
-                return Settings.LayerInfoObj == LayerInfo;
-            }))
-        {
-            LandscapeInfo->Layers.Add(FLandscapeInfoLayerSettings(LayerInfo, Landscape));
-        }
-    }
-#endif
+	if (!Landscape->EditorLayerSettings.ContainsByPredicate(MatchesLayerInfo))
+	{
+		Landscape->EditorLayerSettings.Add(FLandscapeEditorLayerSettings(LayerInfo));
+	}
+
+	if (ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo())
+	{
+		if (!LandscapeInfo->Layers.ContainsByPredicate(MatchesLayerInfo))
+		{
+			LandscapeInfo->Layers.Add(FLandscapeInfoLayerSettings(LayerInfo, Landscape));
+		}
+	}
 }
+
+#else // !WITH_EDITOR
+
+void AGrassGenerator::GenerateGrass()
+{
+	// Generation creates and saves assets, so it exists only in editor builds. Declared
+	// unconditionally so Blueprints referencing it still compile in a packaged build.
+	UE_LOG(LogGrassPlugin, Warning, TEXT("GenerateGrass is an editor-only operation."));
+}
+
+#endif // WITH_EDITOR
